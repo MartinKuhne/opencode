@@ -20,6 +20,7 @@ import { testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 
 const encoder = new TextEncoder()
 
@@ -341,7 +342,7 @@ describe("Project.fromDirectory with worktrees", () => {
     }),
   )
 
-  it.live("separate clones of the same repo should share project ID", () =>
+  it.live("separate clones of the same repo should share project ID and not be added as sandboxes", () =>
     Effect.gen(function* () {
       const project = yield* Project.Service
       const tmp = yield* tmpdirScoped({ git: true })
@@ -359,8 +360,78 @@ describe("Project.fromDirectory with worktrees", () => {
       const next = yield* project.fromDirectory(clone)
 
       expect(next.project.id).toBe(result.project.id)
+      expect(result.project.sandboxes).not.toContain(clone)
+      expect(next.project.sandboxes).not.toContain(clone)
+      expect(next.project.sandboxes).not.toContain(tmp)
+
+      const stored = yield* project.get(result.project.id)
+      expect(stored?.sandboxes).not.toContain(clone)
     }),
   )
+
+  it.live("sanitizes stale or non-worktree directories from sandboxes", () =>
+    Effect.gen(function* () {
+      const project = yield* Project.Service
+      const { db } = yield* Database.Service
+      const tmp = yield* tmpdirScoped({ git: true })
+
+      const bare = tmp + "-bare"
+      const clone = tmp + "-clone"
+      const linked = tmp + "-linked"
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => $`rm -rf ${bare} ${clone} ${linked}`.quiet().nothrow()).pipe(Effect.ignore),
+      )
+      yield* Effect.promise(() => $`git clone --bare ${tmp} ${bare}`.quiet())
+      yield* Effect.promise(() => $`git clone ${bare} ${clone}`.quiet())
+      yield* Effect.promise(() => $`git worktree add ${linked} -b linked-${Date.now()}`.cwd(tmp).quiet())
+
+      const initial = yield* project.fromDirectory(tmp)
+
+      // Directly insert both an independent clone and a true linked worktree into sandboxes
+      yield* db
+        .update(ProjectTable)
+        .set({ sandboxes: [AbsolutePath.make(clone), AbsolutePath.make(linked)] })
+        .where(eq(ProjectTable.id, initial.project.id))
+        .run()
+        .pipe(Effect.orDie)
+
+      // Re-running fromDirectory should sanitize non-worktrees while keeping true linked worktrees
+      const refreshed = yield* project.fromDirectory(tmp)
+      expect(refreshed.project.sandboxes).toContain(linked)
+      expect(refreshed.project.sandboxes).not.toContain(clone)
+    }),
+  )
+
+  it.live("adopts opened directory as primary worktree when existing primary worktree no longer exists", () =>
+    Effect.gen(function* () {
+      const project = yield* Project.Service
+      const { db } = yield* Database.Service
+      const tmp = yield* tmpdirScoped({ git: true })
+
+      const bare = tmp + "-bare"
+      const clone = tmp + "-clone"
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => $`rm -rf ${bare} ${clone}`.quiet().nothrow()).pipe(Effect.ignore),
+      )
+      yield* Effect.promise(() => $`git clone --bare ${tmp} ${bare}`.quiet())
+      yield* Effect.promise(() => $`git clone ${bare} ${clone}`.quiet())
+
+      const initial = yield* project.fromDirectory(tmp)
+
+      // Simulate the original worktree directory being deleted/moved
+      const nonExistent = AbsolutePath.make(path.join(tmp, "deleted-worktree"))
+      yield* db
+        .update(ProjectTable)
+        .set({ worktree: nonExistent })
+        .where(eq(ProjectTable.id, initial.project.id))
+        .run()
+        .pipe(Effect.orDie)
+
+      const result = yield* project.fromDirectory(clone)
+      expect(result.project.worktree).toBe(clone)
+    }),
+  )
+
 
   it.live("should accumulate multiple worktrees in sandboxes", () =>
     Effect.gen(function* () {

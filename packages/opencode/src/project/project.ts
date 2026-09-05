@@ -232,25 +232,42 @@ const layer = Layer.effect(
 
       if (flags.experimentalIconDiscovery) yield* discover(existing).pipe(Effect.ignore, Effect.forkIn(scope))
 
+      const primaryExists = yield* fs.exists(existing.worktree).pipe(Effect.orDie)
+      const currentWorktree =
+        projectID === ProjectV2.ID.global || !primaryExists ? worktree : existing.worktree
+
       const result: Info = {
         ...existing,
-        worktree: projectID === ProjectV2.ID.global ? worktree : existing.worktree,
+        worktree: currentWorktree,
         vcs: data.vcs?.type ?? fakeVcs,
         time: { ...existing.time, updated: Date.now() },
       }
-      if (
+
+      const primary =
+        result.worktree === data.directory
+          ? data
+          : yield* projectV2.resolve(AbsolutePath.make(result.worktree))
+
+      const isLinkedWorktree =
         projectID !== ProjectV2.ID.global &&
         data.directory !== result.worktree &&
-        !result.sandboxes.includes(data.directory)
-      )
+        sameGitStore(primary.vcs?.store, data.vcs?.store)
+
+      if (isLinkedWorktree && !result.sandboxes.includes(data.directory))
         result.sandboxes.push(data.directory)
+
       result.sandboxes = yield* Effect.forEach(
         result.sandboxes,
         (s) =>
-          fs.exists(s).pipe(
-            Effect.orDie,
-            Effect.map((exists) => (exists ? s : undefined)),
-          ),
+          Effect.gen(function* () {
+            if (s === result.worktree) return undefined
+            const exists = yield* fs.exists(s).pipe(Effect.orDie)
+            if (!exists) return undefined
+            if (!primary.vcs?.store) return undefined
+            if (s === data.directory) return isLinkedWorktree ? s : undefined
+            const sData = yield* projectV2.resolve(AbsolutePath.make(s))
+            return sameGitStore(primary.vcs.store, sData.vcs?.store) ? s : undefined
+          }),
         { concurrency: "unbounded" },
       ).pipe(Effect.map((arr) => arr.filter((x): x is string => x !== undefined)))
 
@@ -479,5 +496,15 @@ export const node = LayerNode.make({
     Database.node,
   ],
 })
+
+function sameGitStore(a?: string, b?: string) {
+  if (!a || !b) return false
+  const normA = FSUtil.resolve(a)
+  const normB = FSUtil.resolve(b)
+  if (process.platform === "win32") {
+    return normA.toLowerCase() === normB.toLowerCase()
+  }
+  return normA === normB
+}
 
 export * as Project from "./project"
